@@ -334,9 +334,51 @@ static bool _@(message.structure.namespaced_type.name)__cdr_deserialize(
 @[      elif isinstance(member.type.value_type, NamespacedType)]@
     uint32_t size;
     rv = ucdr_deserialize_uint32_t(cdr, &size);
+    if (!rv) {
+      return false;
+    }
 
-    if(size > ros_message->@(member.name).capacity){
-      return 0;
+    if (size > ros_message->@(member.name).capacity) {
+      // Sibling bug to the AbstractString case below (see its comment for
+      // the full rationale): an *unbounded* sequence<NamespacedType>
+      // (e.g. a nested message array) also starts out completely empty
+      // (capacity 0) for any freshly-constructed destination. Properly
+      // growing it would call the *other* message package's own generated
+      // <Type>__Sequence__init() (so each new element is correctly
+      // default-constructed, e.g. its own nested strings/sequences zeroed
+      // the same way this file already zeroes them for its own type) --
+      // but that function isn't available here: this file deliberately
+      // never links directly against sibling message packages beyond
+      // their struct layout (already visible via the include chain),
+      // reaching their cdr_serialize/cdr_deserialize only indirectly
+      // through the generic message_type_support_callbacks_t v-table
+      // below, which has no "construct a default instance" entry of its
+      // own. Only handle the common case -- a genuinely empty
+      // (never-yet-allocated) destination -- with a plain zero-filled
+      // allocation (`sizeof(*ros_message->@(member.name).data)` gives the
+      // element size without needing that other package's literal C
+      // typename at all: `sizeof(*ptr)` is a compile-time property of
+      // `ptr`'s pointee TYPE, evaluated without ever dereferencing `ptr`,
+      // so this is safe even though `data` is NULL here). This is
+      // equivalent to a proper per-element __init() for the overwhelming
+      // majority of message types, whose own fields all default to their
+      // natural zero value (0/false/empty-string/empty-sequence) -- the
+      // same assumption every other "empty means zeroed" message struct
+      // in this codegen already relies on. A destination that's *already*
+      // partially populated and still too small (capacity > 0 but < size)
+      // falls back to the previous behavior instead of growing, since
+      // properly releasing its existing elements' own sub-allocations
+      // needs that same unavailable per-type fini().
+      if (ros_message->@(member.name).capacity == 0) {
+        void * new_data = calloc(size, sizeof(*ros_message->@(member.name).data));
+        if (new_data == NULL) {
+          return false;
+        }
+        ros_message->@(member.name).data = new_data;
+        ros_message->@(member.name).capacity = size;
+      } else {
+        return 0;
+      }
     }
 
     ros_message->@(member.name).size = size;
