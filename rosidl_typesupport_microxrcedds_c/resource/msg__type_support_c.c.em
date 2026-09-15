@@ -32,6 +32,10 @@ header_files = [
     'stdio.h',
     'stdlib.h',
     'string.h',
+    # Provides rosidl_runtime_c__String__Sequence__init/__fini(), used to
+    # grow an unbounded sequence<string> member to fit an incoming message
+    # (see the AbstractSequence/AbstractString deserialize branch below).
+    'rosidl_runtime_c/string_functions.h',
     # Provides the rosidl_typesupport_microxrcedds_c__identifier symbol declaration.
     'rosidl_typesupport_microxrcedds_c/identifier.h',
     # Provides the definition of the message_type_support_callbacks_t struct.
@@ -347,9 +351,37 @@ static bool _@(message.structure.namespaced_type.name)__cdr_deserialize(
 @[      elif isinstance(member.type.value_type, AbstractString)]@
     uint32_t size;
     rv = ucdr_deserialize_uint32_t(cdr, &size);
+    if (!rv) {
+      return false;
+    }
 
-    if(size > ros_message->@(member.name).capacity){
-      return 0;
+    if (size > ros_message->@(member.name).capacity) {
+      // Unlike a bounded sequence<string> (whose destination is already
+      // allocated at its full maximum_size, so this branch is unreachable
+      // for it), an *unbounded* sequence<string>'s destination starts out
+      // completely empty (capacity 0) -- it's default-constructed well
+      // before the real wire size is known, e.g. by rcl_take_request_with_
+      // info()'s own create_from_py(pyrequest_type) building a fresh,
+      // empty request to deserialize into. `size > capacity` is therefore
+      // not an error here; it's the normal case for any non-empty
+      // unbounded sequence<string>. The previous `return 0;` here silently
+      // rejected every such message before ever reaching the per-element
+      // loop below (and its own capacity handling, fixed in #86) --
+      // confirmed empirically: a real rclpy service request carrying a
+      // single-element `string[]` field consistently failed
+      // cdr_deserialize() this way, even though the exact same bytes
+      // decode correctly once this sequence is pre-sized to fit.
+      // rosidl_runtime_c__String__Sequence__fini() is safe to call
+      // unconditionally, including on an already-empty (all-zero)
+      // sequence -- it only frees `data` when non-NULL -- so this also
+      // correctly handles the rarer case of a destination that was
+      // already partially populated (from a previous, differently-sized
+      // deserialize into the same reused message object) instead of
+      // leaking its old element buffers.
+      rosidl_runtime_c__String__Sequence__fini(&ros_message->@(member.name));
+      if (!rosidl_runtime_c__String__Sequence__init(&ros_message->@(member.name), size)) {
+        return false;
+      }
     }
     ros_message->@(member.name).size = size;
 
